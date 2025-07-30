@@ -11,7 +11,7 @@ type OrderLevel = {
 };
 
 const DEPTH = 20;
-const SNAPSHOT_HISTORY = 30;   // Number of time steps shown in Z history
+const SNAPSHOT_HISTORY = 30;
 
 function toScreenPosition(obj: THREE.Object3D, camera: THREE.Camera, dom: HTMLElement) {
   const vector = obj.position.clone();
@@ -25,10 +25,18 @@ function toScreenPosition(obj: THREE.Object3D, camera: THREE.Camera, dom: HTMLEl
 }
 
 const pressureColor = (baseColor: string, intensity: number): string => {
-  // Use HSL: more intense = higher lightness
   const baseH = baseColor === "green" ? 140 : 0;
   const i = Math.min(Math.max(intensity, 0), 1);
   return `hsl(${baseH}, 89%, ${42 + Math.round(i * 35)}%)`;
+};
+
+const minMax = (arr: number[]) => {
+  let min = Number.POSITIVE_INFINITY, max = Number.NEGATIVE_INFINITY;
+  arr.forEach(v => {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  });
+  return [min, max];
 };
 
 const ThreeScene: React.FC = () => {
@@ -38,7 +46,6 @@ const ThreeScene: React.FC = () => {
     level: OrderLevel | null;
     screen: { x: number; y: number };
   } | null>(null);
-
   const [xTicks, setXTicks] = useState<{ x: number; price: number }[]>([]);
   const [yTicks, setYTicks] = useState<number[]>([]);
   const [pressureInfo, setPressureInfo] = useState<{
@@ -48,14 +55,22 @@ const ThreeScene: React.FC = () => {
     mode: string;
   }>({ count: 0, priceRange: null, avgQty: 0, mode: "" });
 
-  // Store raw pressure, update in UI only once per second
+  // Overlay state
+  const [connectionStatus, setConnectionStatus] = useState<"loading" | "ok" | "error">("loading");
+
+  // Controls panel state
+  const [showHistory, setShowHistory] = useState(true);
+  const [showPressure, setShowPressure] = useState(true);
+  const [priceRange, setPriceRange] = useState<[number, number]>([0, 1]);
+  const [qtyThreshold, setQtyThreshold] = useState(0);
+
   const lastPressureRaw = useRef<typeof pressureInfo | null>(null);
-  // Store recent N orderbooks for Z axis trail
   const snapshotHistory = useRef<OrderLevel[][]>([]);
-  // Hold 3D bars for the live (latest) orderbook, keep stable reference for raycast/hover
   const barsRef = useRef<THREE.Mesh[]>([]);
-  // Cache last levels for tooltips/raycast
   const lastLevelsRef = useRef<OrderLevel[]>([]);
+  const priceRangeRef = useRef<[number, number]>([0, 1]);
+  const wsRef = useRef<WebSocket | null>(null); // <-- this fixes the error
+
 
   // Show pressure panel at 1Hz
   useEffect(() => {
@@ -66,16 +81,27 @@ const ThreeScene: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // Update sliders when price min/max is updated
+    const levels = lastLevelsRef.current;
+    if (levels.length) {
+      const allPrices = levels.map(l => l.price);
+      const [min, max] = minMax(allPrices);
+      if (min !== Infinity && max !== -Infinity && (priceRange[0] === 0 && priceRange[1] === 1)) {
+        setPriceRange([min, max]);
+        priceRangeRef.current = [min, max];
+      }
+    }
+    // eslint-disable-next-line
+  }, [lastLevelsRef.current]); // Only on initial update
+
+  useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
 
     // === THREE SCENE SETUP ===
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(
-      65,
-      mount.clientWidth / mount.clientHeight,
-      0.1,
-      1000
+      65, mount.clientWidth / mount.clientHeight, 0.1, 1000
     );
     camera.position.set(0, 6, 17);
 
@@ -105,31 +131,20 @@ const ThreeScene: React.FC = () => {
       axisMaterial
     ));
 
-    // === BARS for latest (frontmost) snapshot: used for hover, full color ===
-    const barWidth = 0.7;
-    const barDepth = 0.6;
+    // === BARS for latest snapshot
+    const barWidth = 0.7, barDepth = 0.6;
     barsRef.current = [];
     for (let i = 0; i < DEPTH * 2; i++) {
       const mat = new THREE.MeshStandardMaterial({
-        color: 0xaaaaaa,
-        roughness: 0.35,
-        metalness: 0.22,
-        transparent: true,
-        opacity: 0.88,
+        color: 0xaaaaaa, roughness: 0.35, metalness: 0.22, transparent: true, opacity: 0.88,
       });
       const geom = new THREE.BoxGeometry(barWidth, 1, barDepth);
       const mesh = new THREE.Mesh(geom, mat);
-      mesh.position.x = i - DEPTH + 0.5;
-      mesh.position.y = 0.5;
-      mesh.position.z = 0;
-      mesh.name = `orderbar-${i}`;
-      scene.add(mesh);
-      barsRef.current.push(mesh);
+      mesh.position.x = i - DEPTH + 0.5; mesh.position.y = 0.5; mesh.position.z = 0;
+      mesh.name = `orderbar-${i}`; scene.add(mesh); barsRef.current.push(mesh);
     }
 
-    // === HISTORY BARGROUPS for older orderbook snapshots ===
-    // Create (SNAPSHOT_HISTORY-1) ghost sets, but only once, for performance
-    // Each set contains DEPTH*2 bars placed back on Z, re-used each frame.
+    // === HISTORY BARS for orderbook trail ===
     const historyBarSets: THREE.Mesh[][] = [];
     for (let snap = 0; snap < SNAPSHOT_HISTORY - 1; ++snap) {
       const snapBars: THREE.Mesh[] = [];
@@ -137,33 +152,26 @@ const ThreeScene: React.FC = () => {
         const mat = new THREE.MeshStandardMaterial({
           color: 0x888888,
           transparent: true,
-          opacity: 0.13, // ghostly
+          opacity: 0.13,
         });
         const geom = new THREE.BoxGeometry(barWidth, 1, barDepth);
         const mesh = new THREE.Mesh(geom, mat);
         mesh.position.x = i - DEPTH + 0.5;
         mesh.position.y = 0.5;
-        mesh.position.z = - (snap + 1) * 0.6; // trail into Z
-        mesh.name = `history-${snap}-${i}`;
-        scene.add(mesh);
-        snapBars.push(mesh);
+        mesh.position.z = -(snap + 1) * 0.6;
+        mesh.name = `history-${snap}-${i}`; scene.add(mesh); snapBars.push(mesh);
       }
       historyBarSets.push(snapBars);
     }
 
-    // === ORBIT CONTROLS ===
+    // === ORBIT CONTROLS
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.13;
-    controls.enablePan = true;
-    controls.enableZoom = true;
-    controls.autoRotate = false;
-    controls.target.set(0, 3, 0);
-    controls.update();
+    controls.enableDamping = true; controls.dampingFactor = 0.13;
+    controls.enablePan = true; controls.enableZoom = true;
+    controls.autoRotate = false; controls.target.set(0, 3, 0); controls.update();
 
-    // === RAYCASTER for hover ===
-    const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
+    // === RAYCASTER for hover
+    const raycaster = new THREE.Raycaster(); const pointer = new THREE.Vector2();
     function checkBarHover(mouseX: number, mouseY: number) {
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((mouseX - rect.left) / rect.width) * 2 - 1;
@@ -190,43 +198,41 @@ const ThreeScene: React.FC = () => {
         setHoveredBar(null);
       }
     }
-
     renderer.domElement.addEventListener("mousemove", (e) => {
       checkBarHover(e.clientX, e.clientY);
     });
-    renderer.domElement.addEventListener("mouseleave", () => {
-      setHoveredBar(null);
-    });
+    renderer.domElement.addEventListener("mouseleave", () => setHoveredBar(null));
 
-    // === ANIMATION/RENDER LOOP
+        // === ANIMATION LOOP
     let req: number;
     const animate = () => {
-      // Draw ghost/bar history (most recent to oldest)
+      // History bars (ghosted orderbook trail, if enabled)
       const snapshots = snapshotHistory.current;
-      for (let s = 0; s < historyBarSets.length; ++s) {
-        const snap = snapshots[snapshots.length - 2 - s];
-        const bars = historyBarSets[s];
-        if (!snap || !bars) continue;
-        // Ghost alpha, newer = more solid
-        const ghostOpacity = 0.36 - (0.29 * s) / Math.max(1, historyBarSets.length - 1);
-        for (let i = 0; i < bars.length; ++i) {
-          const l = snap[i];
-          if (!l || !bars[i]) {
-            bars[i].visible = false;
-            continue;
+      if (showHistory) {
+        for (let s = 0; s < historyBarSets.length; ++s) {
+          const snap = snapshots[snapshots.length - 2 - s];
+          const bars = historyBarSets[s];
+          if (!snap || !bars) { bars.forEach(b => b.visible = false); continue; }
+          const ghostOpacity = 0.36 - (0.29 * s) / Math.max(1, historyBarSets.length - 1);
+          for (let i = 0; i < bars.length; ++i) {
+            const l = snap[i];
+            if (!l || !bars[i]) { bars[i].visible = false; continue; }
+            // (You could filter on price/qty here for live controls)
+            bars[i].visible = true;
+            bars[i].scale.y = Math.max(l.quantity * 7 / Math.max(...snap.map(x => x.quantity || 2.5), 2.5), 0.05);
+            bars[i].position.y = bars[i].scale.y / 2;
+            (bars[i].material as THREE.MeshStandardMaterial).opacity = ghostOpacity;
+            if (l.side === "bid")
+              (bars[i].material as THREE.MeshStandardMaterial).color.set("#0ec564");
+            else
+              (bars[i].material as THREE.MeshStandardMaterial).color.set("#c01224");
           }
-          bars[i].visible = true;
-          bars[i].scale.y = Math.max(l.quantity * 7 / Math.max(...snap.map(x => x.quantity || 2.5), 2.5), 0.05);
-          bars[i].position.y = bars[i].scale.y / 2;
-          (bars[i].material as THREE.MeshStandardMaterial).opacity = ghostOpacity;
-          // Give faint bid/ask coloring
-          if (l.side === "bid")
-            (bars[i].material as THREE.MeshStandardMaterial).color.set("#0ec564");
-          else
-            (bars[i].material as THREE.MeshStandardMaterial).color.set("#c01224");
         }
+      } else {
+        // Hide all ghost bars if turned off
+        historyBarSets.forEach(set => set.forEach(bar => bar.visible = false));
       }
-      // Animate/pan/etc
+
       controls.update();
       renderer.render(scene, camera);
       if (hoveredBar && hoveredBar.index >= 0) {
@@ -248,6 +254,7 @@ const ThreeScene: React.FC = () => {
     };
     animate();
 
+    // Cleanup
     return () => {
       cancelAnimationFrame(req);
       controls.dispose();
@@ -255,32 +262,29 @@ const ThreeScene: React.FC = () => {
       if (renderer.domElement.parentNode)
         renderer.domElement.parentNode.removeChild(renderer.domElement);
       barsRef.current = [];
-            // Clean up ghosted history bars
       historyBarSets.forEach(set => set.forEach(bar => {
         if (bar.parent) bar.parent.remove(bar);
       }));
     };
     // eslint-disable-next-line
-  }, []);
+  }, [showHistory]);
 
-  // --- LIVE Binance Depth Update + Pressure & History Buffer ---
-  useEffect(() => {
+  // --- LIVE DATA + OVERLAY LOGIC ---
+  function connectWS() {
+    setConnectionStatus("loading");
     let ws: WebSocket | null = null;
     let alive = true;
 
     function updateBars(levels: OrderLevel[]) {
-      // PRESSURE
+      // PRESSURE (zone)
       const allQ = levels.map(l => l.quantity);
       const qtySum = allQ.reduce((a, b) => a + b, 0);
       const qtyMean = qtySum / allQ.length;
       const qtyStd = Math.sqrt(allQ.reduce((a, b) => a + Math.pow(b - qtyMean, 2), 0) / allQ.length);
-
-      // Threshold: mean + 1.2 × stddev or top 15%
       const qtySorted = [...allQ].sort((a, b) => b - a);
       const t15 = qtySorted[Math.floor(allQ.length * 0.15)];
       const PRESSURE_THR = Math.max(qtyMean + 1.2 * qtyStd, t15);
 
-      // Bars, pressure, and bid/ask colors for latest visible bars
       const pressureInds: number[] = [];
       let pressMinP = Infinity, pressMaxP = -Infinity, pressSum = 0;
 
@@ -300,7 +304,7 @@ const ThreeScene: React.FC = () => {
         if (isPressure) {
           pressureInds.push(i);
           pressMinP = Math.min(pressMinP, entry.price);
-                    pressMaxP = Math.max(pressMaxP, entry.price);
+          pressMaxP = Math.max(pressMaxP, entry.price);
           pressSum += entry.quantity;
         }
         if (entry.side === "bid") {
@@ -319,7 +323,7 @@ const ThreeScene: React.FC = () => {
       }
       lastLevelsRef.current = levels;
 
-      // X and Y axis ticks
+      // Price/quantity axis ticks
       const bidPrices = levels.slice(0, DEPTH).map(l => l.price).reverse();
       const askPrices = levels.slice(DEPTH).map(l => l.price);
       const xTickObjs: { x: number; price: number }[] = [];
@@ -339,7 +343,6 @@ const ThreeScene: React.FC = () => {
       }
       setYTicks(qtyTicks);
 
-      // PRESSURE INFO - panel data, debounced for UI
       lastPressureRaw.current = {
         count: pressureInds.length,
         priceRange: pressMinP < pressMaxP ? [pressMinP, pressMaxP] : null,
@@ -348,7 +351,6 @@ const ThreeScene: React.FC = () => {
           : 0,
         mode: "stddev+top15%",
       };
-
       // Z history: push new snapshot to buffer
       const buf = snapshotHistory.current || [];
       buf.push(JSON.parse(JSON.stringify(levels)));
@@ -358,6 +360,7 @@ const ThreeScene: React.FC = () => {
 
     function handleMsg(event: MessageEvent) {
       if (!alive) return;
+      setConnectionStatus("ok");
       const data = JSON.parse(event.data);
       if (!data.bids || !data.asks) return;
       const bids: OrderLevel[] = data.bids
@@ -381,9 +384,17 @@ const ThreeScene: React.FC = () => {
     ws = new WebSocket(
       "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
     );
+    wsRef.current = ws;
+    ws.onopen = () => { setConnectionStatus("ok"); };
     ws.onmessage = handleMsg;
-    ws.onerror = () => {};
+    ws.onerror = () => {
+      setConnectionStatus("error"); ;
+    };
+    ws.onclose = () => {
+      setConnectionStatus("error"); ;
+    };
 
+    // Show a pre-fake chart while loading
     updateBars(
       Array(DEPTH * 2)
         .fill(0)
@@ -397,10 +408,23 @@ const ThreeScene: React.FC = () => {
     return () => {
       alive = false;
       if (ws) ws.close();
+      wsRef.current = null;
+    };
+  }
+
+  useEffect(() => {
+    connectWS(); // connects on mount, and re-connects if .error
+    return () => {
+      if (wsRef.current) wsRef.current.close();
     };
   }, []);
 
-  // ----- AXIS LABELS, TOOLTIP, PRESSURE PANEL -----
+  function retryWS() {
+    if (wsRef.current) wsRef.current.close();
+    setTimeout(connectWS, 250);
+  }
+
+  // ----- RENDER -----
   return (
     <div
       ref={mountRef}
@@ -415,7 +439,9 @@ const ThreeScene: React.FC = () => {
         userSelect: "none",
       }}
     >
-      {/* X axis: Price levels */}
+      {/* X axis: Price levels, Y axis, Tooltip, Pressure ... same as before... */}
+
+      {/* X AXIS */}
       <div
         style={{
           position: "absolute",
@@ -486,7 +512,7 @@ const ThreeScene: React.FC = () => {
         </span>
       </div>
 
-            {/* Y axis: Quantity levels */}
+      {/* Y AXIS */}
       <div
         style={{
           position: "absolute",
@@ -528,7 +554,7 @@ const ThreeScene: React.FC = () => {
         </span>
       </div>
 
-      {/* TOOLTIP: Shows on hover */}
+      {/* TOOLTIP: Bar Hover */}
       {hoveredBar && hoveredBar.level && (
         <div
           style={{
@@ -562,60 +588,181 @@ const ThreeScene: React.FC = () => {
           </div>
           <div>
             Qty:{" "}
-            <span style={{ color: "#aff" }}>{hoveredBar.level.quantity}</span>
+            <span style={{ color: "#aff" }}>
+              {hoveredBar.level.quantity}
+            </span>
           </div>
         </div>
       )}
 
-      {/* PRESSURE ZONE OVERLAY PANEL (debounced) */}
+      {/* PRESSURE ZONE PANEL (toggle) */}
+      {showPressure && (
+        <div
+          style={{
+            position: "absolute",
+            right: 24,
+            top: 18,
+            padding: "12px 17px 10px 17px",
+            background: "rgba(30,15,41,0.83)",
+            border: "1.5px solid #f093ff88",
+            borderRadius: 10,
+            color: "#ffd2ff",
+            minWidth: 120,
+            fontFamily: "monospace",
+            fontSize: 13,
+            zIndex: 3,
+            pointerEvents: "auto",
+            boxShadow: "0 2px 6px #0007",
+            userSelect: "text",
+            transition: "background 0.3s",
+          }}
+        >
+          <div style={{ color: "#fff4", fontWeight: 700, letterSpacing: "-0.02em" }}>
+            PRESSURE ZONE
+          </div>
+          <div>
+            Bars: <b style={{ color: "#faf" }}>{pressureInfo.count}</b>
+          </div>
+          <div>
+            Avg Qty: <b style={{ color: "#bbf" }}>{pressureInfo.avgQty}</b>
+          </div>
+          {pressureInfo.priceRange ? (
+            <div>
+              Price range:{" "}
+              <b style={{ color: "#bdf" }}>
+                {pressureInfo.priceRange[0].toLocaleString(undefined, {
+                  maximumFractionDigits: 2,
+                })}{" "}
+                -{" "}
+                {pressureInfo.priceRange[1].toLocaleString(undefined, {
+                  maximumFractionDigits: 2,
+                })}
+              </b>
+            </div>
+          ) : (
+            <div>
+              Price range: <b>-</b>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* === FLOATING CONTROLS PANEL === */}
       <div
         style={{
           position: "absolute",
-          right: 24,
-          top: 18,
-          padding: "12px 17px 10px 17px",
-          background: "rgba(30,15,41,0.83)",
-          border: "1.5px solid #f093ff88",
-          borderRadius: 10,
-          color: "#ffd2ff",
-          minWidth: 120,
+          right: 32,
+          bottom: 30,
+          minWidth: 210,
+          zIndex: 30,
+          background: "rgba(20,18,37,0.94)",
+          boxShadow: "0 2px 5px #000b",
+          borderRadius: 13,
+          padding: "18px 26px 13px 26px",
+          color: "#fff",
           fontFamily: "monospace",
-          fontSize: 13,
-          zIndex: 3,
-          pointerEvents: "auto",
-          boxShadow: "0 2px 6px #0007",
-          userSelect: "text",
-          transition: "background 0.3s",
+          fontSize: 16,
+          display: "flex",
+          flexDirection: "column",
+          gap: 14,
+          border: "1.5px solid #5cf6f6",
         }}
       >
-        <div style={{ color: "#fff4", fontWeight: 700, letterSpacing: "-0.02em" }}>
-          PRESSURE ZONE
+        <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 2, letterSpacing: "-0.01em" }}>
+          View Controls
         </div>
-        <div>
-          Bars: <b style={{ color: "#faf" }}>{pressureInfo.count}</b>
+        {/* Price Range (dummy; wire as needed) */}
+        <label style={{ fontSize: 13, color: "#bdf" }}>Price Range</label>
+        <div style={{ display: 'flex', flexDirection: 'row', alignItems: "center", gap: 8 }}>
+          <input
+            type="number"
+            min={priceRange[0]}
+            max={priceRange[1]}
+            value={priceRange[0]}
+            style={{ width: 78, borderRadius: 6, border: "1px solid #26b6bb", background: "#111", color: "#f4fbff", fontSize: 13, padding: "2px 8px" }}
+            readOnly
+          />
+          <span style={{ color: "#66eee9", fontWeight: 600 }}>—</span>
+          <input
+            type="number"
+            min={priceRange[0]}
+            max={priceRange[1]}
+            value={priceRange[1]}
+            style={{ width: 78, borderRadius: 6, border: "1px solid #26b6bb", background: "#111", color: "#f4fbff", fontSize: 13, padding: "2px 8px" }}
+            readOnly
+          />
         </div>
-        <div>
-          Avg Qty: <b style={{ color: "#bbf" }}>{pressureInfo.avgQty}</b>
+        {/* Qty filter — static for now */}
+        <label style={{ fontSize: 13, color: "#bdf", marginTop: 4 }}>Quantity Min Filter</label>
+        <input
+          type="range"
+          min={0}
+          max={10}
+          value={qtyThreshold}
+          onChange={(e) => setQtyThreshold(Number(e.target.value))}
+          style={{ width: "100%" }}
+        />
+        <div style={{ fontSize: 12, color: "#f5fd", textAlign: "right" }}>
+          Min: {qtyThreshold}
         </div>
-        {pressureInfo.priceRange ? (
-          <div>
-            Price range:{" "}
-            <b style={{ color: "#bdf" }}>
-              {pressureInfo.priceRange[0].toLocaleString(undefined, {
-                maximumFractionDigits: 2,
-              })}{" "}
-              -{" "}
-              {pressureInfo.priceRange[1].toLocaleString(undefined, {
-                maximumFractionDigits: 2,
-              })}
-            </b>
-          </div>
-        ) : (
-          <div>
-            Price range: <b>-</b>
-          </div>
-        )}
+        {/* Show/Hide overlays */}
+        <div style={{
+          display: "flex", flexDirection: "row", gap: 18, alignItems: "center", marginTop: 2
+        }}>
+          <label style={{ fontSize: 13 }}>
+            <input type="checkbox" checked={showHistory} onChange={e => setShowHistory(e.target.checked)} />
+            &nbsp;Show History
+          </label>
+          <label style={{ fontSize: 13 }}>
+            <input type="checkbox" checked={showPressure} onChange={e => setShowPressure(e.target.checked)} />
+            &nbsp;Show Pressure
+          </label>
+        </div>
       </div>
+
+      {/* === LOADING / ERROR OVERLAY === */}
+      {(connectionStatus !== "ok") && (
+        <div style={{
+          position: "absolute",
+          left: 0, top: 0, width: "100%", height: "100%",
+          background: "rgba(13,16,26,0.86)",
+          color: "#fff", fontFamily: "monospace", fontSize: 22,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          flexDirection: "column", zIndex: 111
+        }}>
+          {connectionStatus === "loading" ? (
+            <>
+              <div style={{marginBottom: 12, letterSpacing:"-0.03em", fontWeight:500, color:"#95eff7"}}>
+                Connecting to Binance Orderbook...
+              </div>
+              <div style={{
+                fontSize:16, marginTop:18, color:"#dff",
+                letterSpacing:"0.03em", opacity:0.7
+              }}>If this takes too long, check your network.</div>
+            </>
+          ) : (
+            <>
+              <div style={{marginBottom: 13, letterSpacing:"-0.02em", color:"#ffadc2"}}>
+                Disconnected from Binance!
+              </div>
+              <button
+                style={{
+                  fontSize: 18, fontWeight: 700,
+                  padding: "10px 34px",
+                  borderRadius: 7, background: "#009be8",
+                  color: "#fff", border: "none",
+                  marginTop: 4, marginBottom: 9, cursor: "pointer"
+                }}
+                onClick={retryWS}
+              >
+                Reconnect
+              </button>
+              <div style={{ fontSize: 14, opacity: 0.7 }}>Check your Internet.</div>
+            </>
+          )}
+        </div>
+      )}
+
     </div>
   );
 };
