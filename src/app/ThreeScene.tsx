@@ -168,7 +168,9 @@ const ThreeScene: React.FC = () => {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true; controls.dampingFactor = 0.13;
     controls.enablePan = true; controls.enableZoom = true;
-    controls.autoRotate = false; controls.target.set(0, 3, 0); controls.update();
+    controls.autoRotate = false; 
+// @ts-expect-error: OrbitControls target is not in type definitions
+controls.target.set(0, 3, -Z_SPACING * (HISTORY_SLICES-1)/2);
 
     // === RAYCASTER for hover
     const raycaster = new THREE.Raycaster(); const pointer = new THREE.Vector2();
