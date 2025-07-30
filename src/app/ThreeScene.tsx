@@ -71,6 +71,10 @@ const ThreeScene: React.FC = () => {
   const priceRangeRef = useRef<[number, number]>([0, 1]);
   const wsRef = useRef<WebSocket | null>(null); // <-- this fixes the error
 
+  const Z_SPACING = 0.6; // spacing for ghost/history bars on Z-axis
+const HISTORY_SLICES = SNAPSHOT_HISTORY; // or use 30 directly
+
+
 
   // Show pressure panel at 1Hz
   useEffect(() => {
@@ -165,12 +169,13 @@ const ThreeScene: React.FC = () => {
     }
 
     // === ORBIT CONTROLS
-    const controls = new OrbitControls(camera, renderer.domElement);
+    const controls = new OrbitControls(camera, renderer.domElement) as OrbitControls & {
+  target: THREE.Vector3;
+};
     controls.enableDamping = true; controls.dampingFactor = 0.13;
     controls.enablePan = true; controls.enableZoom = true;
     controls.autoRotate = false; 
-// @ts-expect-error: OrbitControls target is not in type definitions
-controls.target.set(0, 3, -Z_SPACING * (HISTORY_SLICES-1)/2);
+controls.target.set(0, 3, -Z_SPACING * (HISTORY_SLICES - 1) / 2);
 
     // === RAYCASTER for hover
     const raycaster = new THREE.Raycaster(); const pointer = new THREE.Vector2();
