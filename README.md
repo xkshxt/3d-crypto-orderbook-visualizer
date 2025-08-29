@@ -1,4 +1,4 @@
-# GoQuant Crypto Orderbook Depth 3D Visualizer
+# Crypto Orderbook Depth 3D Visualizer
 
 A Next.js + React + Three.js web application that visualizes the live cryptocurrency orderbook as an interactive, rotating 3D chart (price, quantity, time). Includes real-time data streaming, pressure zone detection, and interactive controls.
 
@@ -107,7 +107,7 @@ See the test file for details.
 
 ## 👤 Author / Contact
 
-GoQuant 3D Orderbook Demo — by [AKSHAT JAIN].  
+3D Orderbook Demo — by [AKSHAT JAIN].  
 For assignment/submission only.
 
 ---

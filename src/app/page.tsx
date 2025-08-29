@@ -21,7 +21,7 @@ export default function Home() {
           margin: 0,
           color: "var(--foreground)"
         }}>
-          GoQuant Crypto Orderbook Depth 3D Visualizer
+          Crypto Orderbook Depth 3D Visualizer
         </h1>
         <span style={{
           background: "#232937",
@@ -46,7 +46,7 @@ export default function Home() {
         margin: "36px 42px 0 0",
         opacity: 0.82
       }}>
-        Powered by GoQuant. <span style={{fontSize: "0.92em"}}>Live orderbook data, Binance API.</span>
+        <span style={{fontSize: "0.92em"}}>Live orderbook data, Binance API.</span>
       </footer>
     </main>
   );
